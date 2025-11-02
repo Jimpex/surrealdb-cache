@@ -7,6 +7,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use surrealdb_core::kvs::Datastore;
 use surrealdb_core::options::EngineOptions;
+use surrealdb_core::expr::cleanup_query_cache;
 #[cfg(not(target_family = "wasm"))]
 use tokio::spawn;
 use tokio_util::sync::CancellationToken;
@@ -51,7 +52,8 @@ pub fn init(dbs: Arc<Datastore>, canceller: CancellationToken, opts: &EngineOpti
 	let task3 = spawn_task_node_membership_cleanup(dbs.clone(), canceller.clone(), opts);
 	let task4 = spawn_task_changefeed_cleanup(dbs.clone(), canceller.clone(), opts);
 	let task5 = spawn_task_index_compaction(dbs.clone(), canceller.clone(), opts);
-	Tasks(vec![task1, task2, task3, task4, task5])
+	let task6 = spawn_task_query_cache_cleanup(canceller.clone(), opts);
+	Tasks(vec![task1, task2, task3, task4, task5, task6])
 }
 
 fn spawn_task_node_membership_refresh(
@@ -224,6 +226,35 @@ fn spawn_task_index_compaction(
 			}
 		}
 		trace!("Background task exited: Running index compaction");
+	}))
+}
+
+fn spawn_task_query_cache_cleanup(canceller: CancellationToken, opts: &EngineOptions) -> Task {
+	// Get the delay interval from the config
+	let interval = opts.query_cache_cleanup_interval;
+	// Spawn a future
+	Box::pin(spawn(async move {
+		// Log the interval frequency
+		trace!("Running query cache cleanup every {interval:?}");
+		// Create a new time-based interval ticker
+		let mut ticker = interval_ticker(interval).await;
+		// Loop continuously until the task is cancelled
+		loop {
+			tokio::select! {
+				biased;
+				// Check if this has shutdown
+				_ = canceller.cancelled() => break,
+				// Receive a notification on the channel
+				Some(_) = ticker.next() => {
+					// Clean up expired entries from the global query cache
+					let removed = cleanup_query_cache();
+					if removed > 0 {
+						trace!("Query cache cleanup: removed {removed} expired entries");
+					}
+				}
+			}
+		}
+		trace!("Background task exited: Query cache cleanup");
 	}))
 }
 

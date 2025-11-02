@@ -6,7 +6,7 @@ use crate::sql::changefeed::ChangeFeed;
 use crate::sql::index::{Distance, VectorType};
 use crate::sql::reference::{Reference, ReferenceDeleteStrategy};
 use crate::sql::{
-	Base, Cond, Data, Explain, Expr, Fetch, Fetchs, Field, Fields, Group, Groups, Idiom, Output,
+	Base, Cache, CacheMode, Cond, Data, Explain, Expr, Fetch, Fetchs, Field, Fields, Group, Groups, Idiom, Output,
 	Permission, Permissions, Timeout, View, With,
 };
 use crate::syn::error::bail;
@@ -111,6 +111,49 @@ impl Parser<'_> {
 		}
 		let duration = stk.run(|ctx| self.parse_expr_field(ctx)).await?;
 		Ok(Some(Timeout(duration)))
+	}
+
+	/// Parses a cache clause if the next token is `CACHE`.
+	pub(crate) async fn try_parse_cache(
+		&mut self,
+		stk: &mut Stk,
+	) -> ParseResult<Option<Cache>> {
+		if !self.eat(t!("CACHE")) {
+			return Ok(None);
+		}
+
+		// Parse optional mode: MEMORY or DISK (defaults to MEMORY)
+		let mode = match self.peek_kind() {
+			t!("MEMORY") => {
+				self.pop_peek();
+				CacheMode::Memory
+			}
+			t!("DISK") => {
+				self.pop_peek();
+				CacheMode::Disk
+			}
+			_ => CacheMode::Memory, // Default to MEMORY
+		};
+
+		// Parse optional GLOBAL flag
+		let global = self.eat(t!("GLOBAL"));
+
+		// Parse expiration (required) - accepts both Duration and Datetime
+		let expiration = stk.run(|ctx| self.parse_expr_field(ctx)).await?;
+
+		// Parse optional key (string literal)
+		let key = if matches!(self.peek_kind(), t!("\"") | t!("'")) {
+			Some(self.parse_string_lit()?)
+		} else {
+			None
+		};
+
+		Ok(Some(Cache {
+			mode,
+			expiration,
+			key,
+			global,
+		}))
 	}
 
 	pub(crate) async fn try_parse_fetch(&mut self, stk: &mut Stk) -> ParseResult<Option<Fetchs>> {

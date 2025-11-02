@@ -61,6 +61,7 @@ impl Parser<'_> {
 		} else {
 			None
 		};
+		let cache = self.try_parse_cache(stk).await?;
 		let timeout = self.try_parse_timeout(stk).await?;
 		let parallel = self.eat(t!("PARALLEL"));
 		let tempfiles = self.eat(t!("TEMPFILES"));
@@ -80,6 +81,7 @@ impl Parser<'_> {
 			start,
 			fetch,
 			version,
+			cache,
 			timeout,
 			parallel,
 			tempfiles,

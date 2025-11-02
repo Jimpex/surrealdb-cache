@@ -1,8 +1,11 @@
 use std::fmt;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use anyhow::{Result, ensure};
 use reblessive::tree::Stk;
+use dashmap::DashMap;
+use std::sync::OnceLock;
 
 use crate::ctx::Context;
 use crate::dbs::{Iterator, Options, Statement};
@@ -10,12 +13,30 @@ use crate::doc::CursorDoc;
 use crate::err::Error;
 use crate::expr::order::Ordering;
 use crate::expr::{
-	Cond, Explain, Expr, Fetchs, Fields, FlowResultExt as _, Groups, Limit, Splits, Start, Timeout,
-	With,
+	Cache, Cond, Explain, Expr, Fetchs, Fields, FlowResultExt as _, Groups, Limit, Splits, Start,
+	Timeout, With,
 };
 use crate::fmt::Fmt;
 use crate::idx::planner::{QueryPlanner, RecordStrategy, StatementContext};
 use crate::val::{Datetime, Value};
+
+const TARGET: &str = "surrealdb::core::expr::statements::select";
+
+// Global query cache - single static instance shared across all queries
+pub static QUERY_CACHE: OnceLock<DashMap<String, (SystemTime, Value)>> = OnceLock::new();
+
+/// Clean up expired entries from the query cache
+/// Returns the number of entries removed
+pub fn cleanup_query_cache() -> usize {
+	if let Some(cache) = QUERY_CACHE.get() {
+		let before_count = cache.len();
+		cache.retain(|_, (exp, _)| SystemTime::now() < *exp);
+		let after_count = cache.len();
+		before_count - after_count
+	} else {
+		0
+	}
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct SelectStatement {
@@ -34,6 +55,7 @@ pub(crate) struct SelectStatement {
 	pub start: Option<Start>,
 	pub fetch: Option<Fetchs>,
 	pub version: Option<Expr>,
+	pub cache: Option<Cache>,
 	pub timeout: Option<Timeout>,
 	pub parallel: bool,
 	pub explain: Option<Explain>,
@@ -56,6 +78,7 @@ impl Default for SelectStatement {
 			start: None,
 			fetch: None,
 			version: None,
+			cache: None,
 			timeout: None,
 			parallel: false,
 			explain: None,
@@ -80,6 +103,41 @@ impl SelectStatement {
 		opt: &Options,
 		doc: Option<&CursorDoc>,
 	) -> Result<Value> {
+		// MEMORY cache with auto key generation support
+		if let Some(cache_cfg) = &self.cache {
+			if matches!(cache_cfg.mode, crate::expr::CacheMode::Memory) {
+				// Generate query key: custom or auto-generated
+				let query_key = if let Some(custom_key) = &cache_cfg.key {
+					custom_key.clone()
+				} else {
+					// Auto-generate key from statement
+					crate::dbs::cache::generate_auto_cache_key(&self.to_string())
+				};
+
+				// Build full cache key with auth/ns/db prefix
+				let cache_key =
+					crate::dbs::cache::build_cache_key(&query_key, &*opt, cache_cfg.global);
+
+				let map = QUERY_CACHE.get_or_init(|| DashMap::new());
+
+				trace!(target: TARGET, cache_key = %cache_key, query_key = %query_key, global = cache_cfg.global, "Checking cache");
+
+				if let Some(entry) = map.get(&cache_key) {
+					let (exp, val) = entry.value();
+					let now = SystemTime::now();
+
+					if now < *exp {
+						trace!(target: TARGET, cache_key = %cache_key, "Cache hit");
+						return Ok(val.clone());
+					} else {
+						trace!(target: TARGET, cache_key = %cache_key, "Cache expired");
+					}
+				} else {
+					trace!(target: TARGET, cache_key = %cache_key, "Cache miss");
+				}
+			}
+		}
+
 		// Valid options?
 		opt.valid_for_db()?;
 		// Assign the statement
@@ -126,21 +184,49 @@ impl SelectStatement {
 		// Catch statement timeout
 		ensure!(!ctx.is_timedout().await?, Error::QueryTimedout);
 
-		if self.only {
+		let out = if self.only {
 			match res {
 				Value::Array(mut array) => {
 					if array.is_empty() {
-						Ok(Value::None)
+						Value::None
 					} else {
 						ensure!(array.len() == 1, Error::SingleOnlyOutput);
-						Ok(array.0.pop().expect("array has exactly one element"))
+						array.0.pop().expect("array has exactly one element")
 					}
 				}
-				x => Ok(x),
+				x => x,
 			}
 		} else {
-			Ok(res)
+			res
+		};
+
+		// Store into cache if configured
+		if let Some(cache_cfg) = &self.cache {
+			if matches!(cache_cfg.mode, crate::expr::CacheMode::Memory) {
+				// Generate query key: custom or auto-generated
+				let query_key = if let Some(custom_key) = &cache_cfg.key {
+					custom_key.clone()
+				} else {
+					// Auto-generate key from statement
+					crate::dbs::cache::generate_auto_cache_key(&self.to_string())
+				};
+
+				// Build full cache key with auth/ns/db prefix
+				let cache_key =
+					crate::dbs::cache::build_cache_key(&query_key, &*opt, cache_cfg.global);
+
+				// Compute expiration time using the expr::Cache method
+				let expiration = cache_cfg
+					.compute_expiration(stk, &ctx, &*opt, doc)
+					.await?;
+				
+				let map = QUERY_CACHE.get_or_init(|| DashMap::new());
+				map.insert(cache_key.clone(), (expiration, out.clone()));
+				trace!(target: TARGET, cache_key = %cache_key, total_entries = map.len(), "Stored result in cache");
+			}
 		}
+
+		Ok(out)
 	}
 }
 
@@ -181,6 +267,9 @@ impl fmt::Display for SelectStatement {
 		}
 		if let Some(ref v) = self.version {
 			write!(f, " VERSION {v}")?
+		}
+		if let Some(ref v) = self.cache {
+			write!(f, " {v}")?
 		}
 		if let Some(ref v) = self.timeout {
 			write!(f, " {v}")?

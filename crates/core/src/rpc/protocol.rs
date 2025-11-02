@@ -663,6 +663,7 @@ pub trait RpcProtocol {
 			start: None,
 			fetch: None,
 			version: None,
+			cache: None,
 			timeout: None,
 			parallel: false,
 			explain: None,

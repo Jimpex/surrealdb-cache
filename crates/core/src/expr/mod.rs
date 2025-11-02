@@ -11,6 +11,7 @@ pub(crate) mod algorithm;
 pub(crate) mod base;
 pub(crate) mod block;
 pub(crate) mod bytesize;
+pub(crate) mod cache;
 pub(crate) mod changefeed;
 pub(crate) mod cond;
 pub(crate) mod constant;
@@ -55,6 +56,10 @@ pub(crate) mod decimal;
 
 mod closure;
 pub(crate) mod statements;
+
+// Re-export query cache cleanup function for SDK access
+pub use self::statements::select::cleanup_query_cache;
+
 pub mod visit;
 
 pub(crate) use self::access_type::{AccessType, JwtAccess, RecordAccess};
@@ -62,6 +67,7 @@ pub(crate) use self::algorithm::Algorithm;
 pub(crate) use self::base::Base;
 pub(crate) use self::block::Block;
 pub(crate) use self::bytesize::Bytesize;
+pub(crate) use self::cache::{Cache, CacheMode};
 pub(crate) use self::changefeed::ChangeFeed;
 pub(crate) use self::closure::ClosureExpr;
 pub(crate) use self::cond::Cond;
